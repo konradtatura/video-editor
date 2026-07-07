@@ -1,0 +1,21 @@
+# Python virtual environment -- rebuild via each skill's requirements.txt
+venv-whisper/
+
+# Personal projects (raw footage, rendered outputs, transcripts) -- not
+# part of the shared skills, may contain personal video content
+projects/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Unrelated cloned repo from early exploration, not part of this project
+hyperframes/
+
+# Commercial/unverified-license fonts must never be committed -- only
+# OFL-licensed fonts built by this repo's own fontTools process belong here
+.claude/skills/captions/assets/ProximaNova-Semibold.otf

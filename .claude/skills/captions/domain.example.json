@@ -1,0 +1,9 @@
+{
+  "niche": "Describe the content niche in a sentence or two -- who the speaker is, what they talk about, what audience this is for. Example: 'Marketing coach content in Polish -- paid ads, copywriting, and business/personal-brand advice for course creators and coaches.'",
+  "vocabulary": [
+    "List domain jargon, acronyms, product/metric names the speaker uses often.",
+    "These are NOT auto-applied like glossary.json -- they're context for judging whether an ambiguous or low-confidence word might actually be one of these, mangled.",
+    "Example entries for a marketing-coach niche: ROAS, CTA, call to action, CPA, CPM, LTV, funnel, lejek sprzedażowy, lead magnet, high-ticket, coaching, mentoring, konwersja, kampania"
+  ],
+  "notes": "Anything that helps judge ambiguous words in context -- typical phrasing patterns, what numbers usually refer to, names/products mentioned often. Example: 'Numbers followed by \"x\" almost always refer to a named ad-performance metric (ROAS, conversion rate), not a generic multiplier -- if a number+x reads as just \"5 times\" with no stated subject, that is a strong signal something got mis-transcribed, not that the speaker was vague.'"
+}
