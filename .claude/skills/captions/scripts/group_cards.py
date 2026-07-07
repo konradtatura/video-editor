@@ -133,8 +133,9 @@ def main():
     parser.add_argument("words_json")
     parser.add_argument("glossary_json")
     parser.add_argument("output_captions_json")
-    parser.add_argument("--max-words", type=int, default=4)
+    parser.add_argument("--max-words", type=int, default=2)
     parser.add_argument("--timeline", default=None, help="path to timeline.json (from rough-cut's render.py) -- if given, cards never span a hard cut")
+    parser.add_argument("--no-highlight", action="store_true", help="apply glossary corrections but skip the highlight color -- all words render in the default text color")
     args = parser.parse_args()
 
     with open(args.words_json, encoding="utf-8") as f:
@@ -148,6 +149,9 @@ def main():
             cuts = json.load(f)["cuts"]
 
     merged_words = apply_glossary(words_data["words"], glossary)
+    if args.no_highlight:
+        for w in merged_words:
+            w["highlight"] = None
     cards = group_into_cards(merged_words, args.max_words, cuts=cuts)
 
     out = {"cards": cards}

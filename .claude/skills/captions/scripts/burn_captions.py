@@ -65,6 +65,10 @@ DEFAULT_STYLE = {
                            # position" for how to recompute this per video
     "default_highlight": "#FE2C55",  # TikTok red, used if a word is
                                        # highlighted but no color was set
+    "lowercase": True,     # renders every word lowercase regardless of how
+                            # it was cased in the transcript -- consistent
+                            # caption look, matches typical CapCut/TikTok
+                            # caption style. Set False to preserve casing.
 }
 
 
@@ -112,7 +116,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         parts = []
         for w in card["words"]:
             color = hex_to_ass_color(w["highlight"]) if isinstance(w.get("highlight"), str) else (default_highlight if w.get("highlight") else None)
-            text = w["text"]
+            text = w["text"].lower() if style.get("lowercase", True) else w["text"]
             if color:
                 parts.append(f"{{\\c{color}}}{text}{{\\c{primary}}}")
             else:
