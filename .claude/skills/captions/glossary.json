@@ -1,0 +1,19 @@
+{
+  "terms": [
+    {
+      "canonical": "call to action",
+      "mishearings": ["Coldplay Action", "Colt Auction", "cultu action", "kolt akszyn"],
+      "highlight": "#FE2C55"
+    },
+    {
+      "canonical": "ROAS",
+      "mishearings": ["rolaz", "0az", "relax", "raz"],
+      "highlight": "#25F4EE"
+    },
+    {
+      "canonical": "ChatGPT",
+      "mishearings": ["czat GPT", "chat GBT", "czat dżi pi ti"],
+      "highlight": "#FE2C55"
+    }
+  ]
+}

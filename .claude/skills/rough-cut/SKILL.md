@@ -64,6 +64,12 @@ cp <source video> projects/<name>/raw.mp4
 
 ### 2. Transcribe
 
+Both scripts below support an optional Groq API backend (`TRANSCRIBE_BACKEND=groq`,
+same `whisper-large-v3` model, seconds instead of minutes, audio leaves the machine)
+alongside the default local `faster-whisper` path -- see the repo [README](../../../README.md#transcription-backend-local-vs-groq)
+for setup, cost, and the local/cloud tradeoff. Falls back to local automatically if
+`GROQ_API_KEY` is missing or a Groq call fails.
+
 Primary pass (chunked, splits at real measured pauses, independent decode per chunk):
 
 ```
@@ -170,3 +176,4 @@ Even a `[NO_MATCH]` or a clean report is not proof of anything by itself -- see 
 - `scripts/verify.py` -- automated post-render sanity check: repeated n-grams, bloated word timestamps, and silence gaps, each cross-checked against `bursts.py`/`find_repeats.py`'s acoustic evidence (including the deep-scan fallback) and labeled CONFIRMED/NO_MATCH/INCONCLUSIVE.
 - `scripts/locate.py` -- maps an output-relative timestamp back to the raw-footage time and cutlist entry it came from, for iterating on feedback given against the rendered video.
 - `scripts/ffmpeg_util.py` -- shared ffmpeg binary resolution (PATH, with a winget-install fallback path).
+- `scripts/groq_backend.py` -- optional cloud transcription backend (`TRANSCRIBE_BACKEND=groq`): extracts audio, calls Groq's `whisper-large-v3` API, normalizes the response to this pipeline's segment/word schema. See repo README for setup.

@@ -6,3 +6,4 @@
 faster-whisper
 numpy
 scipy
+groq

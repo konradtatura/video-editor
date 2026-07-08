@@ -46,6 +46,8 @@ python scripts/make_captions.py projects/<name>/output.mp4 projects/<name>/words
 ```
 Uses `large-v3` (same reasoning as the rough-cut skill: smaller models miss things). Flags any word under 0.6 confidence -- check those against the glossary even if they don't look like an obvious mishearing.
 
+Supports `TRANSCRIBE_BACKEND=groq` for a much faster cloud transcription pass (same `whisper-large-v3` model, via Groq's API) -- see the repo [README](../../../README.md#transcription-backend-local-vs-groq) for setup and the local/cloud tradeoff. Falls back to local automatically if `GROQ_API_KEY` is missing or the call fails. Note: Groq's API doesn't return a per-word confidence score, so the under-0.6-confidence flag above never fires on Groq-sourced transcripts -- a low-confidence word from Groq will look identical to a high-confidence one, so read the transcript itself a bit more carefully in that mode.
+
 ### 2. Read the domain profile, then build/extend the glossary
 
 `domain.json` is CONTEXT for judgment, not a mechanical file -- read it before reading the transcript, the same way you'd want background on a topic before editing an article about it:

@@ -28,18 +28,17 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 
-from faster_whisper import WhisperModel
+import groq_backend
+
+TRANSCRIBE_BACKEND = os.environ.get("TRANSCRIBE_BACKEND", "local").lower()
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_media")
-    parser.add_argument("output_json")
-    parser.add_argument("--language", default="pl")
-    parser.add_argument("--model", default="large-v3")
-    args = parser.parse_args()
+def _transcribe_local(args):
+    from faster_whisper import WhisperModel
 
     print(f"[transcribe2] loading model={args.model}", file=sys.stderr)
     model = WhisperModel(args.model, device="cpu", compute_type="int8")
@@ -74,6 +73,34 @@ def main():
             "compression_ratio": seg.compression_ratio,
         })
         print(f"[transcribe2] [{seg.start:6.2f}-{seg.end:6.2f}] {seg.text}", file=sys.stderr)
+    return out_segments
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_media")
+    parser.add_argument("output_json")
+    parser.add_argument("--language", default="pl")
+    parser.add_argument("--model", default="large-v3")
+    args = parser.parse_args()
+
+    backend = TRANSCRIBE_BACKEND
+    out_segments = None
+
+    if backend == "groq":
+        try:
+            client = groq_backend.get_client()
+            print("[transcribe2] backend=groq (whisper-large-v3 via Groq API)", file=sys.stderr)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                out_segments = groq_backend.transcribe_whole_file(client, args.input_media, args.language, tmp_dir)
+            for seg in out_segments:
+                print(f"[transcribe2] [{seg['start']:6.2f}-{seg['end']:6.2f}] {seg['text']}", file=sys.stderr)
+        except groq_backend.GroqUnavailable as e:
+            print(f"[transcribe2] TRANSCRIBE_BACKEND=groq requested but unavailable ({e}) -- falling back to local faster-whisper", file=sys.stderr)
+            backend = "local"
+
+    if backend == "local":
+        out_segments = _transcribe_local(args)
 
     out = {"language": args.language, "segments": out_segments}
     with open(args.output_json, "w", encoding="utf-8") as f:

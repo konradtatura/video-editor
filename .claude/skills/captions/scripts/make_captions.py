@@ -17,18 +17,17 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 
-from faster_whisper import WhisperModel
+import groq_backend
+
+TRANSCRIBE_BACKEND = os.environ.get("TRANSCRIBE_BACKEND", "local").lower()
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("video")
-    parser.add_argument("output_json")
-    parser.add_argument("--language", default="pl")
-    parser.add_argument("--model", default="large-v3")
-    args = parser.parse_args()
+def _transcribe_local(args):
+    from faster_whisper import WhisperModel
 
     print(f"[make_captions] transcribing {args.video} with {args.model}...", file=sys.stderr)
     model = WhisperModel(args.model, device="cpu", compute_type="int8")
@@ -48,6 +47,47 @@ def main():
                 "end": round(w.end, 3),
                 "score": round(w.probability, 3),
             })
+    return words
+
+
+def _transcribe_groq(args):
+    client = groq_backend.get_client()
+    print("[make_captions] backend=groq (whisper-large-v3 via Groq API)", file=sys.stderr)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        segments = groq_backend.transcribe_whole_file(client, args.video, args.language, tmp_dir)
+
+    words = []
+    for seg in segments:
+        for w in seg["words"]:
+            words.append({
+                "word": w["word"],
+                "start": round(w["start"], 3),
+                "end": round(w["end"], 3),
+                "score": round(w["score"], 3),
+            })
+    return words
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("video")
+    parser.add_argument("output_json")
+    parser.add_argument("--language", default="pl")
+    parser.add_argument("--model", default="large-v3")
+    args = parser.parse_args()
+
+    backend = TRANSCRIBE_BACKEND
+    words = None
+
+    if backend == "groq":
+        try:
+            words = _transcribe_groq(args)
+        except groq_backend.GroqUnavailable as e:
+            print(f"[make_captions] TRANSCRIBE_BACKEND=groq requested but unavailable ({e}) -- falling back to local faster-whisper", file=sys.stderr)
+            backend = "local"
+
+    if backend == "local":
+        words = _transcribe_local(args)
 
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump({"language": args.language, "words": words}, f, ensure_ascii=False, indent=2)

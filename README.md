@@ -35,6 +35,19 @@ Installing the CPU-only `torch` line *first*, separately, matters — otherwise 
 
 No WSL, no WhisperX, no Adobe/Creative Cloud — both skills use `faster-whisper` directly (not the full `whisperx` package) specifically to avoid a Windows Smart App Control issue with one of whisperx's dependencies, and every bundled font is free/OFL-licensed (no commercial font included).
 
+## Transcription backend: local vs. Groq
+
+Both skills transcribe with local `faster-whisper` (`large-v3`, CPU) by default — accurate, but minutes per clip. There's an optional cloud backend using [Groq](https://groq.com)'s API, which runs the same `whisper-large-v3` model on their hardware and returns results in seconds instead of minutes, at roughly $0.03–0.05 per hour of audio (with a free tier).
+
+**Tradeoff:** with the Groq backend, the extracted audio track leaves your machine and is sent to Groq's API. Local mode keeps everything on-device. Use local for anything sensitive or offline; use Groq when you want fast turnaround and don't mind the audio going over the network.
+
+To use it:
+1. Get an API key at [console.groq.com/keys](https://console.groq.com/keys).
+2. Set it in your shell: `export GROQ_API_KEY=gsk_...` (or put it in a local, gitignored `.env` and `source .env`). Never commit this key.
+3. Set `TRANSCRIBE_BACKEND=groq` before running any transcription step (`chunk_transcribe.py`, `transcribe2.py`, `make_captions.py`). Default is `local` if unset.
+
+If `TRANSCRIBE_BACKEND=groq` is set but `GROQ_API_KEY` is missing, or a Groq API call fails (rate limit, network, invalid key), each script prints a clear message and falls back to local `faster-whisper` rather than crashing.
+
 ## Using it in Claude Code
 
 This repo *is* the `.claude/skills/` layout Claude Code expects. Either:

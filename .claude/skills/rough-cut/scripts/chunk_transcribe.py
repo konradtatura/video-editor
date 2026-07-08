@@ -36,14 +36,15 @@ import subprocess
 import sys
 import tempfile
 
-from faster_whisper import WhisperModel
-
 from audio_boundaries import load_envelope
 from ffmpeg_util import find_ffmpeg
+import groq_backend
 
 MIN_PAUSE_S = 0.35
 MIN_CHUNK_S = 3.0
 MAX_CHUNK_S = 18.0
+
+TRANSCRIBE_BACKEND = os.environ.get("TRANSCRIBE_BACKEND", "local").lower()
 
 
 def find_split_points(envelope, total_duration):
@@ -106,12 +107,42 @@ def main():
     chunks = build_chunks(splits, total_duration)
     print(f"[chunk_transcribe] {len(chunks)} chunks from {len(splits)} measured pauses", file=sys.stderr)
 
+    backend = TRANSCRIBE_BACKEND
+    groq_client = None
+    if backend == "groq":
+        try:
+            groq_client = groq_backend.get_client()
+            print("[chunk_transcribe] backend=groq (whisper-large-v3 via Groq API)", file=sys.stderr)
+        except groq_backend.GroqUnavailable as e:
+            print(f"[chunk_transcribe] TRANSCRIBE_BACKEND=groq requested but unavailable ({e}) -- falling back to local faster-whisper", file=sys.stderr)
+            backend = "local"
+
     ffmpeg = find_ffmpeg()
-    model = WhisperModel(args.model, device="cpu", compute_type="int8")
+    model = None
+    if backend == "local":
+        from faster_whisper import WhisperModel
+        model = WhisperModel(args.model, device="cpu", compute_type="int8")
 
     all_segments = []
     with tempfile.TemporaryDirectory() as tmp_dir:
         for idx, (c_start, c_end) in enumerate(chunks):
+            if backend == "groq":
+                try:
+                    chunk_audio = os.path.join(tmp_dir, f"chunk_{idx}.mp3")
+                    groq_backend.extract_audio_range(args.input_media, chunk_audio, c_start, c_end)
+                    raw = groq_backend.transcribe_audio_file(groq_client, chunk_audio, args.language)
+                    chunk_segments = groq_backend.normalize_groq_response(raw, time_offset=c_start)
+                except groq_backend.GroqUnavailable as e:
+                    print(f"[chunk_transcribe] Groq call failed mid-run ({e}) -- falling back to local faster-whisper for the rest of this file", file=sys.stderr)
+                    backend = "local"
+                    from faster_whisper import WhisperModel
+                    model = WhisperModel(args.model, device="cpu", compute_type="int8")
+                else:
+                    all_segments.extend(chunk_segments)
+                    chunk_text_parts = [s["text"] for s in chunk_segments]
+                    print(f"[chunk_transcribe] chunk {idx+1}/{len(chunks)} [{c_start:.2f}-{c_end:.2f}]: {' '.join(chunk_text_parts)}", file=sys.stderr)
+                    continue
+
             chunk_wav = os.path.join(tmp_dir, f"chunk_{idx}.wav")
             cmd = [
                 ffmpeg, "-y", "-ss", f"{c_start:.3f}", "-to", f"{c_end:.3f}",

@@ -13,9 +13,13 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Secrets -- never commit API keys
+.env
+
 # Unrelated cloned repo from early exploration, not part of this project
 hyperframes/
 
 # Commercial/unverified-license fonts must never be committed -- only
 # OFL-licensed fonts built by this repo's own fontTools process belong here
 .claude/skills/captions/assets/ProximaNova-Semibold.otf
+output/
