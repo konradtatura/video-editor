@@ -117,6 +117,45 @@ class VoiceEnvelope:
         true_end = float(self.times[last_edge])
         return min(true_end + pad, claimed_end + forward_tolerance)
 
+    def list_bursts(self, lo=None, hi=None, min_duration=0.05):
+        """Return every voiced burst (a sustained_rise paired with the next
+        sustained_fall) as {"start", "end", "duration"}, optionally restricted
+        to [lo, hi]. This is the acoustic ground truth a stutter/retake shows
+        up as -- independent of anything Whisper decodes, since it can delete
+        a repeat from the transcript text but cannot delete the audio energy
+        that produced it. See detect_repeats.py for using this to find
+        acoustically-similar burst pairs (candidate retakes).
+
+        A brief stop-consonant/breath dip *inside* one continuous utterance
+        can itself satisfy the sustained_rise condition (voice resumes for
+        >=150ms right after it) even though the dip before it wasn't a
+        sustained silence -- this produced overlapping/duplicate bursts
+        sharing the same end when first implemented. Any rise that occurs
+        before the fall paired with an earlier rise is therefore treated as
+        internal to that same burst and skipped, not a new burst."""
+        lo = self.times[0] if lo is None else lo
+        hi = self.times[-1] if hi is None else hi
+        i_lo = np.searchsorted(self.times, lo)
+        i_hi = np.searchsorted(self.times, hi)
+        rises = np.where(self.sustained_rise[i_lo:i_hi])[0] + i_lo
+        falls = np.where(self.sustained_fall[i_lo:i_hi])[0] + i_lo
+        bursts = []
+        ri, fi = 0, 0
+        while ri < len(rises):
+            r = rises[ri]
+            while fi < len(falls) and falls[fi] <= r:
+                fi += 1
+            if fi >= len(falls):
+                break
+            f = falls[fi]
+            start, end = float(self.times[r]), float(self.times[f])
+            if end - start >= min_duration:
+                bursts.append({"start": start, "end": end, "duration": end - start})
+            while ri < len(rises) and rises[ri] <= f:
+                ri += 1
+            fi += 1
+        return bursts
+
     def snap_start(self, claimed_start, upper_bound=None, lookahead=1.0, backward_tolerance=0.3, pad=0.03):
         """Find the true first-voiced sample at/after claimed_start (minus a
         small backward tolerance) and return that boundary - pad.
