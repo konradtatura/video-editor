@@ -301,6 +301,14 @@ document.addEventListener('keydown', (e) => {{
     e.preventDefault();
     video.pause();
     video.currentTime = Math.min(TOTAL_DURATION, video.currentTime + (e.shiftKey ? BIG_STEP : STEP));
+  }} else if (e.code === 'Space' || e.key === ' ') {{
+    // Handled explicitly (not left to the browser default) so it works
+    // the same regardless of what last had focus -- e.g. without this,
+    // pressing space right after clicking "Mark start" would re-trigger
+    // that button via the browser's native space-activates-focused-
+    // button behavior instead of toggling playback.
+    e.preventDefault();
+    if (video.paused) video.play(); else video.pause();
   }}
 }});
 
