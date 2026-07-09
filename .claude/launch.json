@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "review-console",
-      "runtimeExecutable": "venv-whisper/Scripts/python.exe",
+      "runtimeExecutable": "python",
       "runtimeArgs": [".claude/skills/rough-cut/scripts/range_server.py", "8420", "--directory", "projects"],
       "port": 8420
     }

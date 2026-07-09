@@ -12,17 +12,12 @@ handed back via a "copy to clipboard, paste into chat" button rather than a
 one-click send -- still eliminates all timestamp-guessing (the actual
 problem), just costs one paste instead of zero.
 
-Also lets the user drag a clip's raw start/end boundary directly (click a
-clip on the timeline to open its trim panel, scrub the raw footage, "set
-start/end here", Save & re-render) -- confirmed user preference: describing
-a cut point in words to be translated back into a timestamp is slower and
-less reliable than nudging it by ear/eye directly, so the flag-list flow
-above is for coarse/structural notes ("repeat left in") while trimming is
-for fine boundary placement. This still writes through cutlist.json (via
-range_server.py's POST /api/trim, which edits the file and re-renders) --
-it is not a UI-only preview, cutlist.json stays the single source of truth,
-it's just edited from the browser now instead of by Claude relaying a
-timestamp back into the file by hand.
+Scope, deliberately: this DOES let the user mark problems while watching.
+This does NOT let them trim/edit/re-render from the page -- that would mean
+rebuilding a video editor and abandoning cutlist.json as the single source
+of truth, which is what makes the render/verify loop fast and auditable.
+Editing stays with Claude, reading the flags back and translating them into
+cutlist.json edits (the same way prose feedback always was).
 
 Usage:
     python review_console.py <project_dir> [--video output_review.mp4] [--out review.html]
@@ -132,50 +127,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }}
   .copy-btn.copied {{ background: #1e3a2a; border-color: #2f6b46; color: #7fe0a3; }}
   .empty {{ color: #6d7280; font-size: 13px; font-style: italic; }}
-  .tl-clip.editing {{ outline: 2px solid #5b8cff; outline-offset: -1px; }}
-  .trim-panel {{
-    margin-top: 14px; background: #1c2029; border: 1px solid #2a2f3a; border-radius: 8px;
-    padding: 12px; font-size: 13px;
-  }}
-  .trim-panel h3 {{ margin: 0 0 8px; font-size: 13px; color: #fff; }}
-  .trim-panel .note-preview {{ color: #8a8d95; font-size: 12px; margin-bottom: 10px; }}
-  .trim-row {{ display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }}
-  .trim-row label {{ width: 42px; color: #8a8d95; }}
-  .trim-row input[type=number] {{
-    width: 90px; background: #14161a; color: #e8e8ea; border: 1px solid #383e4a;
-    border-radius: 6px; padding: 5px 7px; font-size: 13px;
-  }}
-  .trim-row button {{
-    background: #262b35; color: #e8e8ea; border: 1px solid #383e4a; border-radius: 6px;
-    padding: 5px 9px; font-size: 12px; cursor: pointer;
-  }}
-  .trim-row button:hover {{ background: #323947; }}
-  #rawPreview {{ width: 100%; max-height: 30vh; border-radius: 6px; background: #000; margin: 8px 0; display: block; }}
-  .trim-actions {{ display: flex; gap: 8px; margin-top: 10px; }}
-  .save-btn {{
-    flex: 1; background: #2f8a4e; color: #fff; border: none; border-radius: 8px;
-    padding: 9px; font-size: 13px; cursor: pointer; font-weight: 600;
-  }}
-  .save-btn:disabled {{ background: #2a3b30; color: #7a8a80; cursor: default; }}
-  .cancel-btn {{
-    background: #262b35; color: #e8e8ea; border: 1px solid #383e4a; border-radius: 8px;
-    padding: 9px 14px; font-size: 13px; cursor: pointer;
-  }}
-  .trim-status {{ font-size: 12px; margin-top: 8px; color: #8a8d95; }}
-  .trim-status.err {{ color: #ff8a8a; }}
-  .trim-status.ok {{ color: #7fe0a3; }}
 </style>
 </head>
 <body>
 
 <h1>{project_name} -- review</h1>
-<div class="sub">Watch, click a flag type at the moment you notice something (pauses the video), optionally add a short note, then copy the list into chat. Click a clip on the timeline to nudge its cut boundaries directly.</div>
+<div class="sub">Watch, click a flag type at the moment you notice something (pauses the video), optionally add a short note, then copy the list into chat. No timestamps to guess.</div>
 
 <div class="layout">
   <div class="video-col">
     <video id="v" src="{video_src}" controls></video>
     <div class="timeline" id="timeline"></div>
-    <div class="trim-panel" id="trimPanel" style="display:none;"></div>
   </div>
 
   <div class="controls-col">
@@ -199,10 +161,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
-let CUTMAP = {cutmap_json};
-let TOTAL_DURATION = {total_duration};
-const PROJECT_NAME = {project_name_json};
-const RAW_SRC = {raw_src_json};
+const CUTMAP = {cutmap_json};
+const TOTAL_DURATION = {total_duration};
 
 const video = document.getElementById('v');
 const timeline = document.getElementById('timeline');
@@ -212,12 +172,10 @@ const noteBox = document.getElementById('note');
 const addBtn = document.getElementById('addBtn');
 const flagListEl = document.getElementById('flagList');
 const copyBtn = document.getElementById('copyBtn');
-const trimPanel = document.getElementById('trimPanel');
 
 let selectedType = null;
 let pendingTime = null;
 let flags = [];
-let editingClipIndex = null;
 
 function fmt(t) {{
   const m = Math.floor(t / 60);
@@ -227,15 +185,14 @@ function fmt(t) {{
 
 function renderTimeline() {{
   timeline.innerHTML = '';
-  CUTMAP.forEach((c, i) => {{
+  CUTMAP.forEach(c => {{
     const div = document.createElement('div');
-    div.className = 'tl-clip' + (i === editingClipIndex ? ' editing' : '');
+    div.className = 'tl-clip';
     const leftPct = (c.output_start / TOTAL_DURATION) * 100;
     const widthPct = ((c.output_end - c.output_start) / TOTAL_DURATION) * 100;
     div.style.left = leftPct + '%';
     div.style.width = widthPct + '%';
-    div.title = 'clip ' + c.clip + ': ' + c.note_preview + ' (click to edit boundaries)';
-    div.addEventListener('click', (e) => {{ e.stopPropagation(); openTrimPanel(i); }});
+    div.title = 'clip ' + c.clip + ': ' + c.note_preview;
     const label = document.createElement('div');
     label.className = 'tl-clip-label';
     label.textContent = c.clip;
@@ -246,103 +203,6 @@ function renderTimeline() {{
   playhead.className = 'tl-playhead';
   playhead.id = 'playhead';
   timeline.appendChild(playhead);
-}}
-
-function openTrimPanel(i) {{
-  editingClipIndex = i;
-  renderTimeline();
-  renderFlagMarkers();
-  const c = CUTMAP[i];
-  trimPanel.style.display = 'block';
-  trimPanel.innerHTML =
-    '<h3>Clip ' + c.clip + ' -- raw footage boundaries</h3>' +
-    '<div class="note-preview">' + c.note_preview.replace(/</g,'&lt;') + '</div>' +
-    '<video id="rawPreview" src="' + RAW_SRC + '" controls></video>' +
-    '<div class="trim-row"><label>start</label>' +
-      '<input type="number" id="startInput" step="0.05" value="' + c.raw_start.toFixed(2) + '">' +
-      '<button id="seekStartBtn">jump to it</button>' +
-      '<button id="setStartBtn">set = preview time</button></div>' +
-    '<div class="trim-row"><label>end</label>' +
-      '<input type="number" id="endInput" step="0.05" value="' + c.raw_end.toFixed(2) + '">' +
-      '<button id="seekEndBtn">jump to it</button>' +
-      '<button id="setEndBtn">set = preview time</button></div>' +
-    '<div class="trim-actions">' +
-      '<button class="save-btn" id="saveTrimBtn">Save &amp; re-render</button>' +
-      '<button class="cancel-btn" id="cancelTrimBtn">Close</button>' +
-    '</div>' +
-    '<div class="trim-status" id="trimStatus"></div>';
-
-  const rawPreview = document.getElementById('rawPreview');
-  const startInput = document.getElementById('startInput');
-  const endInput = document.getElementById('endInput');
-  const trimStatus = document.getElementById('trimStatus');
-
-  document.getElementById('seekStartBtn').addEventListener('click', () => {{
-    rawPreview.currentTime = Math.max(0, parseFloat(startInput.value) - 1.0);
-  }});
-  document.getElementById('seekEndBtn').addEventListener('click', () => {{
-    rawPreview.currentTime = Math.max(0, parseFloat(endInput.value) - 1.0);
-  }});
-  document.getElementById('setStartBtn').addEventListener('click', () => {{
-    startInput.value = rawPreview.currentTime.toFixed(2);
-  }});
-  document.getElementById('setEndBtn').addEventListener('click', () => {{
-    endInput.value = rawPreview.currentTime.toFixed(2);
-  }});
-  document.getElementById('cancelTrimBtn').addEventListener('click', closeTrimPanel);
-
-  document.getElementById('saveTrimBtn').addEventListener('click', async () => {{
-    const newStart = parseFloat(startInput.value);
-    const newEnd = parseFloat(endInput.value);
-    if (!(newEnd > newStart)) {{
-      trimStatus.textContent = 'end must be after start';
-      trimStatus.className = 'trim-status err';
-      return;
-    }}
-    const saveBtn = document.getElementById('saveTrimBtn');
-    saveBtn.disabled = true;
-    saveBtn.textContent = 'Re-rendering...';
-    trimStatus.textContent = '';
-    trimStatus.className = 'trim-status';
-    try {{
-      const resp = await fetch('/api/trim', {{
-        method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{project: PROJECT_NAME, clip_index: i, start: newStart, end: newEnd}}),
-      }});
-      const data = await resp.json();
-      if (!data.ok) {{
-        trimStatus.textContent = 'failed: ' + (data.error || 'unknown error');
-        trimStatus.className = 'trim-status err';
-        saveBtn.disabled = false;
-        saveBtn.textContent = 'Save & re-render';
-        return;
-      }}
-      CUTMAP = data.cutmap;
-      TOTAL_DURATION = data.total_duration;
-      renderTimeline();
-      renderFlagMarkers();
-      video.src = video.getAttribute('src').split('?')[0] + '?t=' + Date.now();
-      video.load();
-      trimStatus.textContent = 'saved and re-rendered.';
-      trimStatus.className = 'trim-status ok';
-      saveBtn.disabled = false;
-      saveBtn.textContent = 'Save & re-render';
-    }} catch (err) {{
-      trimStatus.textContent = 'request failed: ' + err;
-      trimStatus.className = 'trim-status err';
-      saveBtn.disabled = false;
-      saveBtn.textContent = 'Save & re-render';
-    }}
-  }});
-}}
-
-function closeTrimPanel() {{
-  editingClipIndex = null;
-  trimPanel.style.display = 'none';
-  trimPanel.innerHTML = '';
-  renderTimeline();
-  renderFlagMarkers();
 }}
 
 function updatePlayhead() {{
@@ -485,9 +345,8 @@ renderTimeline();
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("project_dir")
-    parser.add_argument("--video", default="output.mp4",
-                         help="video file to embed, relative to the project dir (default: the plain render, "
-                              "so trim edits show up immediately without re-running annotate_cuts.py)")
+    parser.add_argument("--video", default="output_review.mp4",
+                         help="video file to embed, relative to the project dir (default: annotate_cuts.py's review copy)")
     parser.add_argument("--out", default="review.html")
     args = parser.parse_args()
 
@@ -506,15 +365,13 @@ def main():
     video_path = os.path.join(project_dir, args.video)
     if not os.path.exists(video_path):
         print(f"[review_console] warning: {args.video} not found in {project_dir} -- "
-              f"run render.py first, or pass --video output_review.mp4 for the numbered-overlay copy", file=sys.stderr)
+              f"run annotate_cuts.py first, or pass --video output.mp4 to use the plain render", file=sys.stderr)
 
     page = PAGE_TEMPLATE.format(
         project_name=html.escape(project_name),
         video_src=html.escape(args.video),
         cutmap_json=json.dumps(cutmap),
         total_duration=total_duration,
-        project_name_json=json.dumps(project_name),
-        raw_src_json=json.dumps(cutlist["source"]),
     )
 
     out_path = os.path.join(project_dir, args.out)

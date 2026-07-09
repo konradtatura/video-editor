@@ -1,8 +1,6 @@
 """
 A static file server with HTTP Range request support, for serving the
-review console's video files locally -- and a small write endpoint
-(POST /api/trim) that lets review.html's trim UI move a clip's raw
-start/end and trigger a re-render without leaving the browser.
+review console's video files locally.
 
 Why this exists: Python's stdlib `http.server.SimpleHTTPRequestHandler` has
 no Range-request handling at all (confirmed by reading its source directly --
@@ -20,32 +18,16 @@ This handles GET with an optional `Range: bytes=start-end` header, replies
 otherwise -- enough for <video> seeking, nothing more (no directory
 listings beyond the stdlib default, no caching headers beyond what's needed).
 
-/api/trim (POST, JSON body {"project", "clip_index", "start", "end"}) is the
-one write path: it edits that project's cutlist.json in place and shells out
-to render.py (cache-aware -- only the changed segment gets re-encoded, a few
-seconds not a full re-render) so a dragged boundary in the browser becomes a
-real edit on disk, the same cutlist.json Claude reads, not a UI-only preview.
-Local-only tool, but still a write endpoint -- project name is checked against
-path traversal before being joined onto the served directory.
-
 Usage:
     python range_server.py [port] [--directory DIR]
 """
 
 import argparse
 import http.server
-import json
 import os
 import re
 import socketserver
-import subprocess
 import sys
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RENDER_SCRIPT = os.path.join(SCRIPT_DIR, "render.py")
-
-sys.path.insert(0, SCRIPT_DIR)
-import review_console  # noqa: E402 -- needs sys.path adjusted above first
 
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -111,88 +93,6 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
-
-    def _send_json(self, status, payload):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_POST(self):
-        if self.path != "/api/trim":
-            self._send_json(404, {"ok": False, "error": "no such endpoint"})
-            return
-
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError as e:
-            self._send_json(400, {"ok": False, "error": f"bad JSON body: {e}"})
-            return
-
-        project = body.get("project", "")
-        clip_index = body.get("clip_index")
-        new_start = body.get("start")
-        new_end = body.get("end")
-
-        # project must be a bare directory name under the served root, not a
-        # path -- this is the one write-capable endpoint on this server, so
-        # traversal here would mean writing/executing outside projects/.
-        if not project or "/" in project or "\\" in project or project in (".", ".."):
-            self._send_json(400, {"ok": False, "error": "invalid project name"})
-            return
-        project_dir = os.path.abspath(project)
-        if not os.path.isdir(project_dir) or os.path.dirname(project_dir) != os.path.abspath("."):
-            self._send_json(400, {"ok": False, "error": "project not found"})
-            return
-
-        cutlist_path = os.path.join(project_dir, "cutlist.json")
-        try:
-            with open(cutlist_path, encoding="utf-8") as f:
-                cutlist = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            self._send_json(500, {"ok": False, "error": f"couldn't read cutlist.json: {e}"})
-            return
-
-        keep = cutlist.get("keep", [])
-        if not isinstance(clip_index, int) or not (0 <= clip_index < len(keep)):
-            self._send_json(400, {"ok": False, "error": f"clip_index out of range (0-{len(keep)-1})"})
-            return
-        try:
-            new_start = float(new_start)
-            new_end = float(new_end)
-        except (TypeError, ValueError):
-            self._send_json(400, {"ok": False, "error": "start/end must be numbers"})
-            return
-        if new_end <= new_start:
-            self._send_json(400, {"ok": False, "error": "end must be after start"})
-            return
-
-        keep[clip_index]["start"] = round(new_start, 3)
-        keep[clip_index]["end"] = round(new_end, 3)
-        with open(cutlist_path, "w", encoding="utf-8") as f:
-            json.dump(cutlist, f, indent=2)
-
-        result = subprocess.run(
-            [sys.executable, RENDER_SCRIPT, project_dir],
-            capture_output=True, text=True, timeout=300,
-        )
-        log = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0:
-            self._send_json(500, {"ok": False, "error": "render.py failed", "log": log[-4000:]})
-            return
-
-        with open(os.path.join(project_dir, "timeline.json"), encoding="utf-8") as f:
-            timeline = json.load(f)
-        cutmap = review_console.build_cutmap(cutlist, timeline["cuts"])
-        self._send_json(200, {
-            "ok": True,
-            "log": log[-4000:],
-            "cutmap": cutmap,
-            "total_duration": timeline["cuts"][-1],
-        })
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
