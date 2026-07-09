@@ -43,6 +43,21 @@ import groq_backend
 MIN_PAUSE_S = 0.35
 MIN_CHUNK_S = 3.0
 MAX_CHUNK_S = 18.0
+# Tried lowering MIN_CHUNK_S for TRANSCRIBE_BACKEND=groq (to 1.5s) on the
+# theory that Groq's near-zero per-call overhead means more/smaller
+# pause-bounded chunks are free, reducing repeat-suppression risk. Tested
+# against a real video and reverted: it did NOT split the rapid stutter it
+# was meant to help (the repeats had less than 1.5s of measurable pause
+# between them, so no floor above ~0.35s would have caught it -- the
+# problem is genuinely gapless, not a chunk-size problem), and it DID
+# introduce a new failure: a ~2s near-silent gap that used to be absorbed
+# into a neighboring chunk became its own tiny chunk, which Groq then
+# hallucinated a plausible sign-off word for ("Dziękuję.") where the audio
+# was actually silence (confirmed: 0 measured voiced bursts in that span).
+# Net result on real data: no benefit on the case that mattered, plus a new
+# hallucination risk. Chunk-boundary tuning cannot fix a genuinely gapless
+# repeat -- that's what the acoustic tools (bursts.py, find_repeats.py,
+# verify.py's cross-check) exist for, independent of chunking strategy.
 
 TRANSCRIBE_BACKEND = os.environ.get("TRANSCRIBE_BACKEND", "local").lower()
 

@@ -45,16 +45,19 @@ Usage:
 """
 
 import argparse
+import os
 import subprocess
 import sys
+import tempfile
 
-from faster_whisper import WhisperModel
-
+import groq_backend
 from audio_boundaries import load_envelope
 from bursts import default_cache_dir
 from dtw_features import compute_features, slice_features, dtw_distance
 from ffmpeg_util import find_ffmpeg
 from local_alignment import subsequence_match
+
+TRANSCRIBE_BACKEND = os.environ.get("TRANSCRIBE_BACKEND", "local").lower()
 
 NGRAM_SIZE = 4
 LONG_WORD_THRESHOLD_S = 1.2
@@ -66,8 +69,9 @@ DEEP_SCAN_WINDOW_MARGIN_S = 15.0     # wider net for deep-scan query bursts when
 DEEP_SCAN_MAX_QUERY_FRACTION = 0.6   # a query must be meaningfully shorter than the haystack it's tested against
 
 
-def transcribe(path, model_size):
-    print(f"[verify] transcribing {path} with {model_size}...", file=sys.stderr)
+def _transcribe_local(path, model_size):
+    from faster_whisper import WhisperModel
+    print(f"[verify] transcribing {path} with {model_size} (local)...", file=sys.stderr)
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
     segments, info = model.transcribe(
         path, language="pl", word_timestamps=True,
@@ -80,6 +84,34 @@ def transcribe(path, model_size):
         for w in (seg.words or []):
             words.append({"word": w.word.strip(), "start": w.start, "end": w.end})
     return words
+
+
+def transcribe(path, model_size):
+    """Backend-selectable, same pattern as chunk_transcribe.py/transcribe2.py
+    (TRANSCRIBE_BACKEND=groq, falls back to local automatically). This was
+    hardcoded to local faster-whisper for a long time after Groq was added
+    everywhere else in the pipeline -- measured directly on a 70s rendered
+    clip: local took 4 minutes, making it by far the single slowest step in
+    the whole rough-cut + captions workflow, an order of magnitude past
+    every other stage combined. Whether Groq's transcription is as reliable
+    for *this specific job* (re-transcribing an already-cut, already-
+    normalized output looking for repeats) as local large-v3 has not been
+    separately re-validated -- watch the first few real runs after this
+    change a bit more closely than usual."""
+    if TRANSCRIBE_BACKEND == "groq":
+        try:
+            client = groq_backend.get_client()
+            print(f"[verify] transcribing {path} with whisper-large-v3 (Groq)...", file=sys.stderr)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                segments = groq_backend.transcribe_whole_file(client, path, "pl", tmp_dir)
+            words = []
+            for seg in segments:
+                for w in seg.get("words", []):
+                    words.append({"word": w["word"].strip(), "start": w["start"], "end": w["end"]})
+            return words
+        except groq_backend.GroqUnavailable as e:
+            print(f"[verify] TRANSCRIBE_BACKEND=groq requested but unavailable ({e}) -- falling back to local faster-whisper", file=sys.stderr)
+    return _transcribe_local(path, model_size)
 
 
 def find_repeated_ngrams(words, n=NGRAM_SIZE):

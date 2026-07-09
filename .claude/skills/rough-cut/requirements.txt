@@ -7,3 +7,4 @@ faster-whisper
 numpy
 scipy
 groq
+transformers  # ctc_backend.py -- second-opinion repeat detector (wav2vec2 CTC), independent of Whisper's decoder bias
