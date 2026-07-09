@@ -1,29 +1,32 @@
 """
-Generates a self-contained review.html for a project: plays the rendered
-output in a real browser (via a local static server, e.g. `.claude/launch.json`'s
-"review-console" config -- python -m http.server), shows a clickable timeline
-strip marking every cut join and clip, and lets the user drop timestamped
-flags while watching instead of writing prose the way they had to before.
+Generates a self-contained review.html for a project: video + timeline in
+sync, arrow-key frame-nudging, and an in/out marker that deletes the marked
+range for real -- writes straight to cutlist.json and re-renders (via
+range_server.py's POST /api/delete-range), with no re-verification step.
 
-Why a real local server instead of an inline chat widget: an inline widget
-runs in a sandboxed context with no access to files on disk, so it cannot
-play a local video file. A local static server can. The tradeoff: flags are
-handed back via a "copy to clipboard, paste into chat" button rather than a
-one-click send -- still eliminates all timestamp-guessing (the actual
-problem), just costs one paste instead of zero.
-
-Scope, deliberately: this DOES let the user mark problems while watching.
-This does NOT let them trim/edit/re-render from the page -- that would mean
-rebuilding a video editor and abandoning cutlist.json as the single source
-of truth, which is what makes the render/verify loop fast and auditable.
-Editing stays with Claude, reading the flags back and translating them into
-cutlist.json edits (the same way prose feedback always was).
+This is deliberately narrower than earlier versions of this tool. Two prior
+designs were built and abandoned in the same project:
+1. A flag-and-copy console (mark a problem, copy a list, paste into chat)
+   -- worked, but still cost a round trip through Claude per fix.
+2. A drag-to-resize timeline trim editor -- rejected by the user after
+   hands-on testing: no undo, can't split, "pain in the ass."
+This version is explicitly scoped to what the user asked for instead:
+"only the timeline... the marker so I can mark the timestamps to delete...
+precise navigating... I don't want reverifying, no checking if now it's
+correct. You are doing your work one time [the automatic pass]. Then manual
+tagging the timestamps to delete, and you are deleting them." So: no resize
+handles (delete-only, never stretches a clip back out past its current
+boundary), no flag types/notes/copy-to-chat, and the delete endpoint does
+not call verify.py or regenerate captions -- it only edits cutlist.json and
+re-renders. Re-verification and recaptioning happen once, separately, when
+the user says they're done (see SKILL.md's "Iterating after review").
 
 Usage:
-    python review_console.py <project_dir> [--video output_review.mp4] [--out review.html]
+    python review_console.py <project_dir> [--video output.mp4] [--out review.html]
 
-Then serve it (e.g. `python -m http.server 8420 --directory projects` from
-the repo root) and open http://localhost:8420/<project_name>/review.html
+Then serve it (`.claude/launch.json`'s "review-console" config, which runs
+range_server.py -- not `python -m http.server`, see range_server.py's own
+docstring for why) and open http://localhost:8420/<project_name>/review.html
 """
 
 import argparse
@@ -64,148 +67,104 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   body {{
     margin: 0; padding: 24px; background: #14161a; color: #e8e8ea;
     font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    max-width: 720px; margin-left: auto; margin-right: auto;
   }}
   h1 {{ font-size: 18px; font-weight: 600; margin: 0 0 4px; color: #fff; }}
-  .sub {{ color: #8a8d95; font-size: 13px; margin-bottom: 20px; }}
-  .layout {{ display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }}
-  .video-col {{ flex: 1 1 260px; max-width: 320px; }}
+  .sub {{ color: #8a8d95; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }}
+  .sub b {{ color: #ccc; }}
   video {{
-    width: 100%; max-height: 78vh; border-radius: 10px; background: #000; display: block;
+    width: 100%; max-height: 70vh; border-radius: 10px; background: #000; display: block;
     object-fit: contain; margin: 0 auto;
   }}
   .timeline {{
-    position: relative; height: 46px; margin-top: 10px; border-radius: 6px;
+    position: relative; height: 52px; margin-top: 10px; border-radius: 6px;
     background: #1f232b; cursor: pointer; overflow: hidden; border: 1px solid #2a2f3a;
   }}
   .tl-clip {{
-    position: absolute; top: 0; bottom: 0; border-right: 1px solid #383e4a;
+    position: absolute; top: 0; bottom: 0; border-right: 1px solid #383e4a; pointer-events: none;
   }}
   .tl-clip:nth-child(odd) {{ background: #232833; }}
   .tl-clip:nth-child(even) {{ background: #1c2029; }}
-  .tl-clip-label {{
-    position: absolute; top: 2px; left: 4px; font-size: 10px; color: #6d7280;
-    pointer-events: none; white-space: nowrap;
-  }}
   .tl-playhead {{
     position: absolute; top: 0; bottom: 0; width: 2px; background: #ff5a5f;
     pointer-events: none; z-index: 5;
   }}
-  .tl-flag {{
-    position: absolute; bottom: 2px; width: 10px; height: 10px; border-radius: 50%;
-    transform: translateX(-50%); border: 1px solid #14161a; z-index: 4; cursor: pointer;
-  }}
   .tl-range {{
-    position: absolute; top: 6px; bottom: 6px; background: rgba(255, 90, 95, 0.35);
-    border: 1px solid #ff5a5f; border-radius: 3px; z-index: 3; cursor: pointer;
+    position: absolute; top: 4px; bottom: 4px; background: rgba(91, 140, 255, 0.35);
+    border: 1px solid #5b8cff; border-radius: 3px; z-index: 3; pointer-events: none;
   }}
-  .tl-range.pending {{ background: rgba(91, 140, 255, 0.35); border-color: #5b8cff; }}
-  .mark-row {{
-    display: flex; gap: 8px; margin: 4px 0 12px; align-items: center;
+  .tl-range.set {{ background: rgba(255, 90, 95, 0.4); border-color: #ff5a5f; }}
+  .now {{ font-variant-numeric: tabular-nums; font-size: 26px; color: #fff; margin: 14px 0 4px; }}
+  .now span {{ color: #6d7280; font-size: 13px; }}
+  .step-row {{ display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }}
+  .step-row button {{
+    background: #262b35; color: #e8e8ea; border: 1px solid #383e4a; border-radius: 8px;
+    padding: 8px 12px; font-size: 13px; cursor: pointer;
   }}
+  .step-row button:hover {{ background: #323947; }}
+  .step-row .hint {{ color: #6d7280; font-size: 12px; }}
+  .mark-row {{ display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }}
   .mark-row button {{
     background: #262b35; color: #e8e8ea; border: 1px solid #383e4a; border-radius: 8px;
-    padding: 9px 12px; font-size: 13px; cursor: pointer;
+    padding: 10px 14px; font-size: 13px; cursor: pointer;
   }}
   .mark-row button:hover {{ background: #323947; }}
   .mark-row button.armed {{ outline: 2px solid #5b8cff; }}
-  .mark-row button:disabled {{ opacity: 0.45; cursor: default; }}
-  .mark-status {{ font-size: 12px; color: #8a8d95; }}
-  .controls-col {{ flex: 1 1 320px; min-width: 300px; }}
-  .now {{ font-variant-numeric: tabular-nums; font-size: 22px; color: #fff; margin-bottom: 14px; }}
-  .now span {{ color: #6d7280; font-size: 13px; }}
-  .flag-buttons {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
-  .flag-buttons button {{
-    background: #262b35; color: #e8e8ea; border: 1px solid #383e4a; border-radius: 8px;
-    padding: 9px 14px; font-size: 13px; cursor: pointer; transition: background .1s;
+  .mark-row button:disabled {{ opacity: 0.4; cursor: default; }}
+  .delete-btn {{
+    background: #7a2020 !important; border-color: #a33 !important; font-weight: 600;
   }}
-  .flag-buttons button:hover {{ background: #323947; }}
-  .flag-buttons button.active {{ outline: 2px solid #5b8cff; }}
-  textarea {{
-    width: 100%; background: #1c2029; color: #e8e8ea; border: 1px solid #383e4a;
-    border-radius: 8px; padding: 8px; font-size: 13px; resize: vertical; min-height: 40px;
-  }}
-  .add-btn {{
-    margin-top: 8px; background: #5b8cff; color: #fff; border: none; border-radius: 8px;
-    padding: 9px 16px; font-size: 13px; cursor: pointer; font-weight: 600;
-  }}
-  .add-btn:disabled {{ background: #384260; cursor: default; }}
-  .flag-list {{ margin-top: 18px; border-top: 1px solid #2a2f3a; padding-top: 12px; }}
-  .flag-item {{
-    display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
-    background: #1c2029; border: 1px solid #2a2f3a; border-radius: 8px; padding: 8px 10px;
-    margin-bottom: 6px; font-size: 13px;
-  }}
-  .flag-item .meta {{ color: #8a8d95; font-size: 11px; }}
-  .flag-item button {{ background: none; border: none; color: #ff5a5f; cursor: pointer; font-size: 13px; }}
-  .copy-btn {{
-    margin-top: 14px; width: 100%; background: #232833; color: #e8e8ea; border: 1px solid #383e4a;
-    border-radius: 8px; padding: 11px; font-size: 13px; cursor: pointer; font-weight: 600;
-  }}
-  .copy-btn.copied {{ background: #1e3a2a; border-color: #2f6b46; color: #7fe0a3; }}
-  .empty {{ color: #6d7280; font-size: 13px; font-style: italic; }}
+  .delete-btn:hover {{ background: #8f2626 !important; }}
+  .mark-status {{ font-size: 13px; color: #8a8d95; min-height: 18px; margin-bottom: 6px; }}
+  .mark-status.ok {{ color: #7fe0a3; }}
+  .mark-status.err {{ color: #ff8a8a; }}
+  .mark-status.busy {{ color: #e0c97f; }}
 </style>
 </head>
 <body>
 
 <h1>{project_name} -- review</h1>
-<div class="sub">Watch, click a flag type at the moment you notice something (pauses the video), optionally add a short note, then copy the list into chat. No timestamps to guess. To mark an exact stretch to cut, press <b>I</b> at the start of it and <b>O</b> at the end (or use the buttons) -- it's added as a precise in/out range, not just a single point.</div>
-
-<div class="layout">
-  <div class="video-col">
-    <video id="v" src="{video_src}" controls></video>
-    <div class="timeline" id="timeline"></div>
-  </div>
-
-  <div class="controls-col">
-    <div class="now"><span>at</span> <span id="nowTime">0:00.0</span></div>
-
-    <div class="mark-row">
-      <button id="markStartBtn" title="Shortcut: I">Mark start of bad part (I)</button>
-      <button id="markEndBtn" disabled title="Shortcut: O">Mark end here (O)</button>
-      <span class="mark-status" id="markStatus"></span>
-    </div>
-
-    <div class="flag-buttons" id="flagButtons">
-      <button data-type="too-early">Cut too early</button>
-      <button data-type="too-late">Cut too late</button>
-      <button data-type="repeat">Repeat left in</button>
-      <button data-type="cut-this">Cut this</button>
-      <button data-type="other">Other</button>
-    </div>
-    <textarea id="note" placeholder="optional note (a few words)"></textarea>
-    <button class="add-btn" id="addBtn" disabled>Pick a flag type above</button>
-
-    <div class="flag-list">
-      <div id="flagList"><div class="empty">No flags yet.</div></div>
-      <button class="copy-btn" id="copyBtn">Copy flags for chat</button>
-    </div>
-  </div>
+<div class="sub">
+  Space/click to play. <b>Left/Right</b> arrows nudge {step}s (hold <b>Shift</b> for {big_step}s).
+  Press <b>I</b> at the start of a bad part, <b>O</b> at the end, then <b>Delete marked range</b> --
+  it cuts that exact span out of the video for real (re-renders, no re-check). Marks only ever
+  remove time, never add it back.
 </div>
 
+<video id="v" src="{video_src}" controls></video>
+<div class="timeline" id="timeline"></div>
+<div class="now"><span>at</span> <span id="nowTime">0:00.00</span></div>
+
+<div class="mark-row">
+  <button id="markStartBtn" title="Shortcut: I">Mark start (I)</button>
+  <button id="markEndBtn" disabled title="Shortcut: O">Mark end (O)</button>
+  <button id="deleteBtn" class="delete-btn" disabled>Delete marked range</button>
+  <button id="cancelMarkBtn" disabled>Cancel mark</button>
+</div>
+<div class="mark-status" id="markStatus"></div>
+
 <script>
-const CUTMAP = {cutmap_json};
-const TOTAL_DURATION = {total_duration};
+let CUTMAP = {cutmap_json};
+let TOTAL_DURATION = {total_duration};
+const PROJECT_NAME = {project_name_json};
+const STEP = {step};
+const BIG_STEP = {big_step};
 
 const video = document.getElementById('v');
 const timeline = document.getElementById('timeline');
 const nowTime = document.getElementById('nowTime');
-const flagButtons = document.getElementById('flagButtons');
-const noteBox = document.getElementById('note');
-const addBtn = document.getElementById('addBtn');
-const flagListEl = document.getElementById('flagList');
-const copyBtn = document.getElementById('copyBtn');
 const markStartBtn = document.getElementById('markStartBtn');
 const markEndBtn = document.getElementById('markEndBtn');
+const deleteBtn = document.getElementById('deleteBtn');
+const cancelMarkBtn = document.getElementById('cancelMarkBtn');
 const markStatus = document.getElementById('markStatus');
 
-let selectedType = null;
-let pendingTime = null;
-let flags = [];
-let pendingRangeStart = null;
+let markStart = null;
+let markEnd = null;
 
 function fmt(t) {{
   const m = Math.floor(t / 60);
-  const s = (t - m * 60).toFixed(1);
+  const s = (t - m * 60).toFixed(2);
   return m + ':' + (s < 10 ? '0' : '') + s;
 }}
 
@@ -214,21 +173,29 @@ function renderTimeline() {{
   CUTMAP.forEach(c => {{
     const div = document.createElement('div');
     div.className = 'tl-clip';
-    const leftPct = (c.output_start / TOTAL_DURATION) * 100;
-    const widthPct = ((c.output_end - c.output_start) / TOTAL_DURATION) * 100;
-    div.style.left = leftPct + '%';
-    div.style.width = widthPct + '%';
-    div.title = 'clip ' + c.clip + ': ' + c.note_preview;
-    const label = document.createElement('div');
-    label.className = 'tl-clip-label';
-    label.textContent = c.clip;
-    div.appendChild(label);
+    div.style.left = ((c.output_start / TOTAL_DURATION) * 100) + '%';
+    div.style.width = (((c.output_end - c.output_start) / TOTAL_DURATION) * 100) + '%';
+    div.title = c.note_preview;
     timeline.appendChild(div);
   }});
   const playhead = document.createElement('div');
   playhead.className = 'tl-playhead';
   playhead.id = 'playhead';
   timeline.appendChild(playhead);
+  renderMarkRange();
+}}
+
+function renderMarkRange() {{
+  const old = document.getElementById('markRangeBar');
+  if (old) old.remove();
+  if (markStart === null) return;
+  const end = markEnd !== null ? markEnd : video.currentTime;
+  const bar = document.createElement('div');
+  bar.id = 'markRangeBar';
+  bar.className = 'tl-range' + (markEnd !== null ? ' set' : '');
+  bar.style.left = ((markStart / TOTAL_DURATION) * 100) + '%';
+  bar.style.width = ((Math.max(0, end - markStart) / TOTAL_DURATION) * 100) + '%';
+  timeline.appendChild(bar);
 }}
 
 function updatePlayhead() {{
@@ -236,104 +203,106 @@ function updatePlayhead() {{
   const ph = document.getElementById('playhead');
   if (ph) ph.style.left = pct + '%';
   nowTime.textContent = fmt(video.currentTime);
-  if (pendingRangeStart !== null) renderFlagMarkers(); // keep the live in-progress range bar in sync while scrubbing
+  if (markStart !== null && markEnd === null) renderMarkRange();
 }}
 
-function clipAt(t) {{
-  const c = CUTMAP.find(c => t >= c.output_start && t < c.output_end);
-  return c ? c.clip : null;
-}}
-
-function renderFlagMarkers() {{
-  document.querySelectorAll('.tl-flag, .tl-range').forEach(el => el.remove());
-  const colors = {{'too-early':'#ffb020','too-late':'#ffb020','repeat':'#ff5a5f','cut-this':'#ff5a5f','other':'#5b8cff'}};
-  flags.forEach((f, i) => {{
-    if (f.type === 'cut-range') {{
-      const bar = document.createElement('div');
-      bar.className = 'tl-range';
-      bar.style.left = ((f.time / TOTAL_DURATION) * 100) + '%';
-      bar.style.width = (((f.end - f.time) / TOTAL_DURATION) * 100) + '%';
-      bar.title = 'cut ' + fmt(f.time) + '–' + fmt(f.end) + (f.note ? ': ' + f.note : '');
-      bar.onclick = (e) => {{ e.stopPropagation(); video.currentTime = f.time; }};
-      timeline.appendChild(bar);
-      return;
-    }}
-    const dot = document.createElement('div');
-    dot.className = 'tl-flag';
-    dot.style.left = ((f.time / TOTAL_DURATION) * 100) + '%';
-    dot.style.background = colors[f.type] || '#5b8cff';
-    dot.title = f.type + ' @ ' + fmt(f.time);
-    dot.onclick = (e) => {{ e.stopPropagation(); video.currentTime = f.time; }};
-    timeline.appendChild(dot);
-  }});
-  if (pendingRangeStart !== null) {{
-    const bar = document.createElement('div');
-    bar.className = 'tl-range pending';
-    bar.style.left = ((pendingRangeStart / TOTAL_DURATION) * 100) + '%';
-    bar.style.width = (((Math.max(video.currentTime, pendingRangeStart) - pendingRangeStart) / TOTAL_DURATION) * 100) + '%';
-    timeline.appendChild(bar);
-  }}
+function setStatus(text, cls) {{
+  markStatus.textContent = text;
+  markStatus.className = 'mark-status' + (cls ? ' ' + cls : '');
 }}
 
 function markRangeStart() {{
-  pendingRangeStart = video.currentTime;
+  markStart = video.currentTime;
+  markEnd = null;
   video.pause();
   markStartBtn.classList.add('armed');
   markEndBtn.disabled = false;
-  markStatus.textContent = 'in point set at ' + fmt(pendingRangeStart) + ' -- play/scrub to the end, then press O';
-  renderFlagMarkers();
+  deleteBtn.disabled = true;
+  cancelMarkBtn.disabled = false;
+  setStatus('in point set at ' + fmt(markStart) + ' -- play/scrub/nudge to the end, then press O');
+  renderMarkRange();
 }}
 
 function markRangeEnd() {{
-  if (pendingRangeStart === null) return;
-  const start = pendingRangeStart;
-  const end = video.currentTime;
+  if (markStart === null) return;
   video.pause();
-  if (end <= start) {{
-    markStatus.textContent = 'end must be after the in point (' + fmt(start) + ') -- try again';
+  if (video.currentTime <= markStart) {{
+    setStatus('end must be after the in point (' + fmt(markStart) + ')', 'err');
     return;
   }}
-  flags.push({{ time: start, end: end, type: 'cut-range', note: noteBox.value.trim() }});
-  flags.sort((a, b) => a.time - b.time);
-  noteBox.value = '';
-  pendingRangeStart = null;
+  markEnd = video.currentTime;
   markStartBtn.classList.remove('armed');
   markEndBtn.disabled = true;
-  markStatus.textContent = 'marked ' + fmt(start) + '–' + fmt(end) + ' to cut';
-  renderFlagList();
-  renderFlagMarkers();
+  deleteBtn.disabled = false;
+  setStatus('marked ' + fmt(markStart) + '–' + fmt(markEnd) + ' -- press Delete marked range to cut it, or Cancel');
+  renderMarkRange();
+}}
+
+function cancelMark() {{
+  markStart = null;
+  markEnd = null;
+  markStartBtn.classList.remove('armed');
+  markEndBtn.disabled = true;
+  deleteBtn.disabled = true;
+  cancelMarkBtn.disabled = true;
+  setStatus('');
+  renderMarkRange();
+}}
+
+async function deleteMarkedRange() {{
+  if (markStart === null || markEnd === null) return;
+  deleteBtn.disabled = true;
+  markStartBtn.disabled = true;
+  setStatus('cutting ' + fmt(markStart) + '–' + fmt(markEnd) + ' and re-rendering...', 'busy');
+  try {{
+    const resp = await fetch('/api/delete-range', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{project: PROJECT_NAME, start: markStart, end: markEnd}}),
+    }});
+    const data = await resp.json();
+    if (!data.ok) {{
+      setStatus('failed: ' + (data.error || 'unknown error'), 'err');
+      deleteBtn.disabled = false;
+      markStartBtn.disabled = false;
+      return;
+    }}
+    CUTMAP = data.cutmap;
+    TOTAL_DURATION = data.total_duration;
+    const cutAt = markStart;
+    cancelMark();
+    renderTimeline();
+    video.src = video.getAttribute('src').split('?')[0] + '?t=' + Date.now();
+    video.load();
+    video.addEventListener('loadedmetadata', () => {{ video.currentTime = Math.min(cutAt, TOTAL_DURATION); }}, {{once: true}});
+    setStatus('deleted -- new duration ' + fmt(TOTAL_DURATION), 'ok');
+  }} catch (err) {{
+    setStatus('request failed: ' + err, 'err');
+  }} finally {{
+    deleteBtn.disabled = true;
+    markStartBtn.disabled = false;
+  }}
 }}
 
 markStartBtn.addEventListener('click', markRangeStart);
 markEndBtn.addEventListener('click', markRangeEnd);
+deleteBtn.addEventListener('click', deleteMarkedRange);
+cancelMarkBtn.addEventListener('click', cancelMark);
 
 document.addEventListener('keydown', (e) => {{
-  if (e.target === noteBox || e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
   if (e.key === 'i' || e.key === 'I') {{ e.preventDefault(); markRangeStart(); }}
   else if (e.key === 'o' || e.key === 'O') {{ e.preventDefault(); markRangeEnd(); }}
-}});
-
-function renderFlagList() {{
-  if (flags.length === 0) {{
-    flagListEl.innerHTML = '<div class="empty">No flags yet.</div>';
-    return;
+  else if (e.key === 'ArrowLeft') {{
+    e.preventDefault();
+    video.pause();
+    video.currentTime = Math.max(0, video.currentTime - (e.shiftKey ? BIG_STEP : STEP));
+  }} else if (e.key === 'ArrowRight') {{
+    e.preventDefault();
+    video.pause();
+    video.currentTime = Math.min(TOTAL_DURATION, video.currentTime + (e.shiftKey ? BIG_STEP : STEP));
   }}
-  flagListEl.innerHTML = '';
-  flags.forEach((f, i) => {{
-    const item = document.createElement('div');
-    item.className = 'flag-item';
-    const clip = clipAt(f.time);
-    const timeLabel = f.type === 'cut-range' ? (fmt(f.time) + '–' + fmt(f.end)) : fmt(f.time);
-    item.innerHTML = '<div><div>' + timeLabel + ' -- <b>' + f.type + '</b>' +
-      (clip ? ' (clip ' + clip + ')' : '') +
-      (f.note ? '<br><span class="meta">' + f.note.replace(/</g,'&lt;') + '</span>' : '') + '</div></div>';
-    const rm = document.createElement('button');
-    rm.textContent = 'remove';
-    rm.onclick = () => {{ flags.splice(i, 1); renderFlagList(); renderFlagMarkers(); }};
-    item.appendChild(rm);
-    flagListEl.appendChild(item);
-  }});
-}}
+}});
 
 timeline.addEventListener('click', (e) => {{
   const rect = timeline.getBoundingClientRect();
@@ -343,81 +312,6 @@ timeline.addEventListener('click', (e) => {{
 
 video.addEventListener('timeupdate', updatePlayhead);
 video.addEventListener('loadedmetadata', updatePlayhead);
-
-flagButtons.querySelectorAll('button').forEach(btn => {{
-  btn.addEventListener('click', () => {{
-    selectedType = btn.dataset.type;
-    pendingTime = video.currentTime;
-    video.pause();
-    flagButtons.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    addBtn.disabled = false;
-    addBtn.textContent = 'Add flag at ' + fmt(pendingTime);
-  }});
-}});
-
-addBtn.addEventListener('click', () => {{
-  flags.push({{ time: pendingTime, type: selectedType, note: noteBox.value.trim() }});
-  flags.sort((a, b) => a.time - b.time);
-  noteBox.value = '';
-  selectedType = null;
-  pendingTime = null;
-  flagButtons.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-  addBtn.disabled = true;
-  addBtn.textContent = 'Pick a flag type above';
-  renderFlagList();
-  renderFlagMarkers();
-}});
-
-function showManualCopyFallback(text) {{
-  // navigator.clipboard.writeText can fail for reasons outside our control
-  // (lost document focus, a denied permission prompt, an older browser) --
-  // confirmed directly that it fails silently if nothing catches the
-  // rejected promise, which would strand the user with no way to get their
-  // flags out. Always have a manual fallback, not just a "copied!" toast
-  // that may not be true.
-  let box = document.getElementById('manualCopyBox');
-  if (!box) {{
-    box = document.createElement('textarea');
-    box.id = 'manualCopyBox';
-    box.style.width = '100%';
-    box.style.marginTop = '10px';
-    box.style.minHeight = '90px';
-    box.style.background = '#1c2029';
-    box.style.color = '#e8e8ea';
-    box.style.border = '1px solid #383e4a';
-    box.style.borderRadius = '8px';
-    box.style.padding = '8px';
-    box.style.fontSize = '12px';
-    copyBtn.insertAdjacentElement('afterend', box);
-  }}
-  box.value = text;
-  box.style.display = 'block';
-  box.focus();
-  box.select();
-}}
-
-copyBtn.addEventListener('click', () => {{
-  if (flags.length === 0) return;
-  const lines = flags.map(f => {{
-    const clip = clipAt(f.time);
-    const timeLabel = f.type === 'cut-range' ? (fmt(f.time) + '–' + fmt(f.end)) : fmt(f.time);
-    return '- ' + timeLabel + (clip ? ' (clip ' + clip + ')' : '') + ' [' + f.type + ']' + (f.note ? ': ' + f.note : '');
-  }});
-  const text = 'Review flags for {project_name}:\\n' + lines.join('\\n');
-
-  if (!navigator.clipboard || !navigator.clipboard.writeText) {{
-    showManualCopyFallback(text);
-    return;
-  }}
-  navigator.clipboard.writeText(text).then(() => {{
-    copyBtn.textContent = 'Copied -- paste into chat';
-    copyBtn.classList.add('copied');
-    setTimeout(() => {{ copyBtn.textContent = 'Copy flags for chat'; copyBtn.classList.remove('copied'); }}, 2000);
-  }}).catch(() => {{
-    showManualCopyFallback(text);
-  }});
-}});
 
 renderTimeline();
 </script>
@@ -429,9 +323,12 @@ renderTimeline();
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("project_dir")
-    parser.add_argument("--video", default="output_review.mp4",
-                         help="video file to embed, relative to the project dir (default: annotate_cuts.py's review copy)")
+    parser.add_argument("--video", default="output.mp4",
+                         help="video file to embed, relative to the project dir (default: the plain render, "
+                              "so deletes show up immediately)")
     parser.add_argument("--out", default="review.html")
+    parser.add_argument("--step", type=float, default=0.2, help="arrow-key nudge size in seconds")
+    parser.add_argument("--big-step", type=float, default=1.0, help="shift+arrow nudge size in seconds")
     args = parser.parse_args()
 
     project_dir = os.path.abspath(args.project_dir)
@@ -449,13 +346,16 @@ def main():
     video_path = os.path.join(project_dir, args.video)
     if not os.path.exists(video_path):
         print(f"[review_console] warning: {args.video} not found in {project_dir} -- "
-              f"run annotate_cuts.py first, or pass --video output.mp4 to use the plain render", file=sys.stderr)
+              f"run render.py first", file=sys.stderr)
 
     page = PAGE_TEMPLATE.format(
         project_name=html.escape(project_name),
         video_src=html.escape(args.video),
         cutmap_json=json.dumps(cutmap),
         total_duration=total_duration,
+        project_name_json=json.dumps(project_name),
+        step=args.step,
+        big_step=args.big_step,
     )
 
     out_path = os.path.join(project_dir, args.out)

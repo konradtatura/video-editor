@@ -1,6 +1,11 @@
 """
 A static file server with HTTP Range request support, for serving the
-review console's video files locally.
+review console's video files locally -- plus one write endpoint,
+POST /api/delete-range, that lets review.html's mark-and-delete tool cut
+an exact output-time range out of cutlist.json and re-render, with no
+re-verification step (by explicit request: one-shot automatic pass is
+Claude's job, manual precise deletion afterward is the human's, and nothing
+should re-check or re-interpret a marked delete range once it's been cut).
 
 Why this exists: Python's stdlib `http.server.SimpleHTTPRequestHandler` has
 no Range-request handling at all (confirmed by reading its source directly --
@@ -24,10 +29,19 @@ Usage:
 
 import argparse
 import http.server
+import json
 import os
 import re
 import socketserver
+import subprocess
 import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RENDER_SCRIPT = os.path.join(SCRIPT_DIR, "render.py")
+sys.path.insert(0, SCRIPT_DIR)
+
+from audio_boundaries import load_envelope  # noqa: E402 -- needs sys.path adjusted above first
+import review_console  # noqa: E402
 
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -93,6 +107,126 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path != "/api/delete-range":
+            self._send_json(404, {"ok": False, "error": "no such endpoint"})
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError as e:
+            self._send_json(400, {"ok": False, "error": f"bad JSON body: {e}"})
+            return
+
+        project = body.get("project", "")
+        try:
+            del_start = float(body.get("start"))
+            del_end = float(body.get("end"))
+        except (TypeError, ValueError):
+            self._send_json(400, {"ok": False, "error": "start/end must be numbers"})
+            return
+        if del_end <= del_start:
+            self._send_json(400, {"ok": False, "error": "end must be after start"})
+            return
+
+        # project must be a bare directory name under the served root, not a
+        # path -- this is the one write-capable endpoint on this server, so
+        # traversal here would mean writing/executing outside projects/.
+        if not project or "/" in project or "\\" in project or project in (".", ".."):
+            self._send_json(400, {"ok": False, "error": "invalid project name"})
+            return
+        project_dir = os.path.abspath(project)
+        if not os.path.isdir(project_dir) or os.path.dirname(project_dir) != os.path.abspath("."):
+            self._send_json(400, {"ok": False, "error": "project not found"})
+            return
+
+        cutlist_path = os.path.join(project_dir, "cutlist.json")
+        try:
+            with open(cutlist_path, encoding="utf-8") as f:
+                cutlist = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self._send_json(500, {"ok": False, "error": f"couldn't read cutlist.json: {e}"})
+            return
+
+        source_path = os.path.join(project_dir, cutlist["source"])
+        segments_dir = os.path.join(project_dir, "segments")
+        try:
+            envelope = load_envelope(source_path, segments_dir)
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": f"couldn't load audio envelope: {e}"})
+            return
+
+        # Recompute the same snapped start/end + cumulative output-time
+        # ranges render.py itself uses, so the delete range (given in
+        # output time by the browser) maps onto the exact raw-footage
+        # offsets actually in output.mp4 -- not the unsnapped cutlist
+        # values. This is a coordinate transform, not a content judgment:
+        # the mark is taken literally, nothing here second-guesses it.
+        new_keep = []
+        cum = 0.0
+        MIN_DUR = 0.05
+        for clip in cutlist["keep"]:
+            s = envelope.snap_start(clip["start"], upper_bound=clip["end"])
+            e = envelope.snap_end(clip["end"], lower_bound=s)
+            dur = e - s
+            out_start, out_end = cum, cum + dur
+            cum = out_end
+
+            overlap_start = max(del_start, out_start)
+            overlap_end = min(del_end, out_end)
+            if overlap_start >= overlap_end:
+                new_keep.append(clip)  # no overlap with the delete range
+                continue
+
+            if overlap_start <= out_start and overlap_end >= out_end:
+                continue  # entire entry deleted
+
+            # offset within this entry maps 1:1 between raw and output time
+            if overlap_start > out_start:
+                pre_end = s + (overlap_start - out_start)
+                if pre_end - clip["start"] > MIN_DUR:
+                    new_keep.append({**clip, "end": round(pre_end, 3)})
+            if overlap_end < out_end:
+                post_start = s + (overlap_end - out_start)
+                if clip["end"] - post_start > MIN_DUR:
+                    new_keep.append({**clip, "start": round(post_start, 3)})
+
+        if not new_keep:
+            self._send_json(400, {"ok": False, "error": "that delete range would remove the entire video"})
+            return
+
+        cutlist["keep"] = new_keep
+        with open(cutlist_path, "w", encoding="utf-8") as f:
+            json.dump(cutlist, f, indent=2)
+
+        result = subprocess.run(
+            [sys.executable, RENDER_SCRIPT, project_dir],
+            capture_output=True, text=True, timeout=300,
+        )
+        log = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            self._send_json(500, {"ok": False, "error": "render.py failed", "log": log[-4000:]})
+            return
+
+        with open(os.path.join(project_dir, "timeline.json"), encoding="utf-8") as f:
+            timeline = json.load(f)
+        cutmap = review_console.build_cutmap(cutlist, timeline["cuts"])
+        self._send_json(200, {
+            "ok": True,
+            "log": log[-4000:],
+            "cutmap": cutmap,
+            "total_duration": timeline["cuts"][-1],
+        })
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
