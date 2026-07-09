@@ -94,6 +94,22 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     position: absolute; bottom: 2px; width: 10px; height: 10px; border-radius: 50%;
     transform: translateX(-50%); border: 1px solid #14161a; z-index: 4; cursor: pointer;
   }}
+  .tl-range {{
+    position: absolute; top: 6px; bottom: 6px; background: rgba(255, 90, 95, 0.35);
+    border: 1px solid #ff5a5f; border-radius: 3px; z-index: 3; cursor: pointer;
+  }}
+  .tl-range.pending {{ background: rgba(91, 140, 255, 0.35); border-color: #5b8cff; }}
+  .mark-row {{
+    display: flex; gap: 8px; margin: 4px 0 12px; align-items: center;
+  }}
+  .mark-row button {{
+    background: #262b35; color: #e8e8ea; border: 1px solid #383e4a; border-radius: 8px;
+    padding: 9px 12px; font-size: 13px; cursor: pointer;
+  }}
+  .mark-row button:hover {{ background: #323947; }}
+  .mark-row button.armed {{ outline: 2px solid #5b8cff; }}
+  .mark-row button:disabled {{ opacity: 0.45; cursor: default; }}
+  .mark-status {{ font-size: 12px; color: #8a8d95; }}
   .controls-col {{ flex: 1 1 320px; min-width: 300px; }}
   .now {{ font-variant-numeric: tabular-nums; font-size: 22px; color: #fff; margin-bottom: 14px; }}
   .now span {{ color: #6d7280; font-size: 13px; }}
@@ -132,7 +148,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 
 <h1>{project_name} -- review</h1>
-<div class="sub">Watch, click a flag type at the moment you notice something (pauses the video), optionally add a short note, then copy the list into chat. No timestamps to guess.</div>
+<div class="sub">Watch, click a flag type at the moment you notice something (pauses the video), optionally add a short note, then copy the list into chat. No timestamps to guess. To mark an exact stretch to cut, press <b>I</b> at the start of it and <b>O</b> at the end (or use the buttons) -- it's added as a precise in/out range, not just a single point.</div>
 
 <div class="layout">
   <div class="video-col">
@@ -142,6 +158,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
   <div class="controls-col">
     <div class="now"><span>at</span> <span id="nowTime">0:00.0</span></div>
+
+    <div class="mark-row">
+      <button id="markStartBtn" title="Shortcut: I">Mark start of bad part (I)</button>
+      <button id="markEndBtn" disabled title="Shortcut: O">Mark end here (O)</button>
+      <span class="mark-status" id="markStatus"></span>
+    </div>
 
     <div class="flag-buttons" id="flagButtons">
       <button data-type="too-early">Cut too early</button>
@@ -172,10 +194,14 @@ const noteBox = document.getElementById('note');
 const addBtn = document.getElementById('addBtn');
 const flagListEl = document.getElementById('flagList');
 const copyBtn = document.getElementById('copyBtn');
+const markStartBtn = document.getElementById('markStartBtn');
+const markEndBtn = document.getElementById('markEndBtn');
+const markStatus = document.getElementById('markStatus');
 
 let selectedType = null;
 let pendingTime = null;
 let flags = [];
+let pendingRangeStart = null;
 
 function fmt(t) {{
   const m = Math.floor(t / 60);
@@ -210,6 +236,7 @@ function updatePlayhead() {{
   const ph = document.getElementById('playhead');
   if (ph) ph.style.left = pct + '%';
   nowTime.textContent = fmt(video.currentTime);
+  if (pendingRangeStart !== null) renderFlagMarkers(); // keep the live in-progress range bar in sync while scrubbing
 }}
 
 function clipAt(t) {{
@@ -218,9 +245,19 @@ function clipAt(t) {{
 }}
 
 function renderFlagMarkers() {{
-  document.querySelectorAll('.tl-flag').forEach(el => el.remove());
+  document.querySelectorAll('.tl-flag, .tl-range').forEach(el => el.remove());
   const colors = {{'too-early':'#ffb020','too-late':'#ffb020','repeat':'#ff5a5f','cut-this':'#ff5a5f','other':'#5b8cff'}};
   flags.forEach((f, i) => {{
+    if (f.type === 'cut-range') {{
+      const bar = document.createElement('div');
+      bar.className = 'tl-range';
+      bar.style.left = ((f.time / TOTAL_DURATION) * 100) + '%';
+      bar.style.width = (((f.end - f.time) / TOTAL_DURATION) * 100) + '%';
+      bar.title = 'cut ' + fmt(f.time) + '–' + fmt(f.end) + (f.note ? ': ' + f.note : '');
+      bar.onclick = (e) => {{ e.stopPropagation(); video.currentTime = f.time; }};
+      timeline.appendChild(bar);
+      return;
+    }}
     const dot = document.createElement('div');
     dot.className = 'tl-flag';
     dot.style.left = ((f.time / TOTAL_DURATION) * 100) + '%';
@@ -229,7 +266,52 @@ function renderFlagMarkers() {{
     dot.onclick = (e) => {{ e.stopPropagation(); video.currentTime = f.time; }};
     timeline.appendChild(dot);
   }});
+  if (pendingRangeStart !== null) {{
+    const bar = document.createElement('div');
+    bar.className = 'tl-range pending';
+    bar.style.left = ((pendingRangeStart / TOTAL_DURATION) * 100) + '%';
+    bar.style.width = (((Math.max(video.currentTime, pendingRangeStart) - pendingRangeStart) / TOTAL_DURATION) * 100) + '%';
+    timeline.appendChild(bar);
+  }}
 }}
+
+function markRangeStart() {{
+  pendingRangeStart = video.currentTime;
+  video.pause();
+  markStartBtn.classList.add('armed');
+  markEndBtn.disabled = false;
+  markStatus.textContent = 'in point set at ' + fmt(pendingRangeStart) + ' -- play/scrub to the end, then press O';
+  renderFlagMarkers();
+}}
+
+function markRangeEnd() {{
+  if (pendingRangeStart === null) return;
+  const start = pendingRangeStart;
+  const end = video.currentTime;
+  video.pause();
+  if (end <= start) {{
+    markStatus.textContent = 'end must be after the in point (' + fmt(start) + ') -- try again';
+    return;
+  }}
+  flags.push({{ time: start, end: end, type: 'cut-range', note: noteBox.value.trim() }});
+  flags.sort((a, b) => a.time - b.time);
+  noteBox.value = '';
+  pendingRangeStart = null;
+  markStartBtn.classList.remove('armed');
+  markEndBtn.disabled = true;
+  markStatus.textContent = 'marked ' + fmt(start) + '–' + fmt(end) + ' to cut';
+  renderFlagList();
+  renderFlagMarkers();
+}}
+
+markStartBtn.addEventListener('click', markRangeStart);
+markEndBtn.addEventListener('click', markRangeEnd);
+
+document.addEventListener('keydown', (e) => {{
+  if (e.target === noteBox || e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.key === 'i' || e.key === 'I') {{ e.preventDefault(); markRangeStart(); }}
+  else if (e.key === 'o' || e.key === 'O') {{ e.preventDefault(); markRangeEnd(); }}
+}});
 
 function renderFlagList() {{
   if (flags.length === 0) {{
@@ -241,7 +323,8 @@ function renderFlagList() {{
     const item = document.createElement('div');
     item.className = 'flag-item';
     const clip = clipAt(f.time);
-    item.innerHTML = '<div><div>' + fmt(f.time) + ' -- <b>' + f.type + '</b>' +
+    const timeLabel = f.type === 'cut-range' ? (fmt(f.time) + '–' + fmt(f.end)) : fmt(f.time);
+    item.innerHTML = '<div><div>' + timeLabel + ' -- <b>' + f.type + '</b>' +
       (clip ? ' (clip ' + clip + ')' : '') +
       (f.note ? '<br><span class="meta">' + f.note.replace(/</g,'&lt;') + '</span>' : '') + '</div></div>';
     const rm = document.createElement('button');
@@ -318,7 +401,8 @@ copyBtn.addEventListener('click', () => {{
   if (flags.length === 0) return;
   const lines = flags.map(f => {{
     const clip = clipAt(f.time);
-    return '- ' + fmt(f.time) + (clip ? ' (clip ' + clip + ')' : '') + ' [' + f.type + ']' + (f.note ? ': ' + f.note : '');
+    const timeLabel = f.type === 'cut-range' ? (fmt(f.time) + '–' + fmt(f.end)) : fmt(f.time);
+    return '- ' + timeLabel + (clip ? ' (clip ' + clip + ')' : '') + ' [' + f.type + ']' + (f.note ? ': ' + f.note : '');
   }});
   const text = 'Review flags for {project_name}:\\n' + lines.join('\\n');
 
