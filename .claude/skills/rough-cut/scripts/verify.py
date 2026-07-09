@@ -32,6 +32,22 @@ Checks performed:
    "is there really a second similar-sounding burst near here" directly
    from signal energy/spectral shape, which a decoder hallucination
    cannot fake and repeat-suppression cannot hide.
+6. NEW: runs ctc_check.py's CTC second-opinion pass on the rendered output
+   itself, not just the raw source. This closes a real, repeated gap: on
+   one real project, a rendered clip that had already passed checks 1-5
+   still had a hidden 4x fused repeat ("U moich klientów...") AND a
+   separate 4x fused "ale" stutter, both invisible to Whisper/Groq's own
+   transcript and to the acoustic burst/DTW cross-check (no bloated word,
+   no burst pair below the distance threshold) -- CTC's independent decode
+   caught both immediately because it has no repeat-suppression bias to
+   begin with. Before this was wired in here, catching these required a
+   human to notice the video still sounded wrong, report it, and only
+   *then* have CTC run manually on the flagged span -- i.e. the exact
+   category of miss this whole check-suite exists to prevent was slipping
+   through because CTC was a raw-file-build-time tool, not a post-render
+   one. Read every CTC finding here the same way ctc_check.py's own docs
+   say to: structure only, never wording, and treat a finding with no
+   Whisper corroboration as the highest priority.
 
 This does not replace watching the video. It narrows down where to listen,
 and the acoustic check narrows it down further -- but it is still evidence
@@ -53,9 +69,16 @@ import tempfile
 import groq_backend
 from audio_boundaries import load_envelope
 from bursts import default_cache_dir
+from ctc_check import dedupe_findings as ctc_dedupe_findings
+from ctc_check import find_adjacent_repeats as ctc_find_adjacent_repeats
+from ctc_check import find_repeated_ngrams as ctc_find_repeated_ngrams
+from ctc_check import transcribe_full as ctc_transcribe_full
 from dtw_features import compute_features, slice_features, dtw_distance
 from ffmpeg_util import find_ffmpeg
 from local_alignment import subsequence_match
+
+CTC_NGRAM = 3
+CTC_CROSS_REFERENCE_WINDOW_S = 3.0
 
 TRANSCRIBE_BACKEND = os.environ.get("TRANSCRIBE_BACKEND", "local").lower()
 
@@ -240,6 +263,9 @@ def main():
     parser.add_argument("output_media")
     parser.add_argument("--model", default="large-v3")
     parser.add_argument("--no-acoustic-check", action="store_true", help="skip the DTW cross-check (faster, text-only)")
+    parser.add_argument("--no-ctc-check", action="store_true",
+                         help="skip the CTC second-opinion pass (faster, but this is the check that has actually caught "
+                              "hidden repeats the Whisper+acoustic checks above missed -- only skip for a quick preview)")
     args = parser.parse_args()
 
     words = transcribe(args.output_media, args.model)
@@ -290,7 +316,30 @@ def main():
     for g in gaps:
         print(f"  {g['start']:.2f}-{g['end']:.2f}s (dur {g['duration']:.2f}s)")
 
-    if not ngram_findings and not bloat_findings and not gaps:
+    ctc_findings = []
+    if not args.no_ctc_check:
+        print("\n[verify] running CTC second-opinion pass on the rendered output (no repeat-suppression bias, "
+              "catches what the Whisper transcript + acoustic check above can both miss)...", file=sys.stderr)
+        ctc_words = ctc_transcribe_full(args.output_media, None, None, 25.0)
+        ctc_findings = ctc_dedupe_findings(ctc_find_repeated_ngrams(ctc_words, CTC_NGRAM) + ctc_find_adjacent_repeats(ctc_words))
+        whisper_repeat_findings = find_repeated_ngrams(words, n=3)
+        for f in ctc_findings:
+            f["whisper_corroborated"] = any(
+                abs(f["first_at"] - wf["first_at"]) <= CTC_CROSS_REFERENCE_WINDOW_S
+                or abs(f["second_at"] - wf["second_at"]) <= CTC_CROSS_REFERENCE_WINDOW_S
+                for wf in whisper_repeat_findings
+            )
+        print(f"\n=== CTC second-opinion repeats ({len(ctc_findings)}) ===")
+        if not ctc_findings:
+            print("none found")
+        for f in ctc_findings:
+            tag = "[ALSO in Whisper transcript]" if f["whisper_corroborated"] else "[**NOT in Whisper transcript -- highest priority**]"
+            print(f"  '{f['phrase']}'  first at {f['first_at']:.2f}s, again at {f['second_at']:.2f}s  {tag}")
+        if ctc_findings:
+            print("[verify] CTC text is phonetically rough -- read every finding above for repeat *structure* only, "
+                  "never for wording. Cross-check against bursts.py or a listen before cutting.")
+
+    if not ngram_findings and not bloat_findings and not gaps and not ctc_findings:
         print("\n[verify] clean -- no automated red flags. Still watch the video before calling it done.")
     else:
         print("\n[verify] red flags found above -- investigate each before considering this cut final.")
