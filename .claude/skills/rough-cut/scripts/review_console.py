@@ -99,6 +99,22 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     position: absolute; bottom: 2px; width: 10px; height: 10px; border-radius: 50%;
     transform: translateX(-50%); border: 1px solid #14161a; z-index: 4; cursor: pointer;
   }}
+  .tl-handle {{
+    position: absolute; top: 0; bottom: 0; width: 10px; z-index: 6; cursor: ew-resize;
+  }}
+  .tl-handle.start {{ left: 0; }}
+  .tl-handle.end {{ right: 0; }}
+  .tl-handle::after {{
+    content: ''; position: absolute; top: 6px; bottom: 6px; left: 4px; width: 2px;
+    background: #5b8cff; border-radius: 2px; opacity: 0; transition: opacity .1s;
+  }}
+  .tl-handle:hover::after, .tl-handle.dragging::after {{ opacity: 1; }}
+  .tl-clip.dragging {{ outline: 2px solid #5b8cff; outline-offset: -1px; z-index: 3; }}
+  .tl-drag-label {{
+    position: absolute; bottom: 100%; margin-bottom: 4px; transform: translateX(-50%);
+    background: #262b35; border: 1px solid #383e4a; border-radius: 4px; padding: 2px 6px;
+    font-size: 11px; white-space: nowrap; pointer-events: none; z-index: 7;
+  }}
   .controls-col {{ flex: 1 1 320px; min-width: 300px; }}
   .now {{ font-variant-numeric: tabular-nums; font-size: 22px; color: #fff; margin-bottom: 14px; }}
   .now span {{ color: #6d7280; font-size: 13px; }}
@@ -169,7 +185,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 
 <h1>{project_name} -- review</h1>
-<div class="sub">Watch, click a flag type at the moment you notice something (pauses the video), optionally add a short note, then copy the list into chat. Click a clip on the timeline to nudge its cut boundaries directly.</div>
+<div class="sub">Watch, click a flag type at the moment you notice something (pauses the video), optionally add a short note, then copy the list into chat. Drag a clip's left/right edge on the timeline to trim it directly, or click the middle of a clip to fine-tune with a raw-footage preview.</div>
 
 <div class="layout">
   <div class="video-col">
@@ -234,8 +250,19 @@ function renderTimeline() {{
     const widthPct = ((c.output_end - c.output_start) / TOTAL_DURATION) * 100;
     div.style.left = leftPct + '%';
     div.style.width = widthPct + '%';
-    div.title = 'clip ' + c.clip + ': ' + c.note_preview + ' (click to edit boundaries)';
+    div.title = 'clip ' + c.clip + ': ' + c.note_preview + ' (drag an edge to trim, click to fine-tune)';
     div.addEventListener('click', (e) => {{ e.stopPropagation(); openTrimPanel(i); }});
+
+    const leftHandle = document.createElement('div');
+    leftHandle.className = 'tl-handle start';
+    leftHandle.addEventListener('mousedown', (e) => {{ startDrag(e, i, 'start'); }});
+    div.appendChild(leftHandle);
+
+    const rightHandle = document.createElement('div');
+    rightHandle.className = 'tl-handle end';
+    rightHandle.addEventListener('mousedown', (e) => {{ startDrag(e, i, 'end'); }});
+    div.appendChild(rightHandle);
+
     const label = document.createElement('div');
     label.className = 'tl-clip-label';
     label.textContent = c.clip;
@@ -246,6 +273,110 @@ function renderTimeline() {{
   playhead.className = 'tl-playhead';
   playhead.id = 'playhead';
   timeline.appendChild(playhead);
+}}
+
+function fmtRaw(t) {{ return t.toFixed(2) + 's'; }}
+
+function startDrag(e, clipIndex, edge) {{
+  e.preventDefault();
+  e.stopPropagation();
+  const c = CUTMAP[clipIndex];
+  const clipDiv = timeline.children[clipIndex];
+  const handle = clipDiv.querySelector('.tl-handle.' + edge);
+  const startClientX = e.clientX;
+  const origRawStart = c.raw_start;
+  const origRawEnd = c.raw_end;
+  const origOutputStart = c.output_start;
+  const origOutputEnd = c.output_end;
+
+  clipDiv.classList.add('dragging');
+  handle.classList.add('dragging');
+  const label = document.createElement('div');
+  label.className = 'tl-drag-label';
+  clipDiv.appendChild(label);
+
+  let liveStart = origRawStart;
+  let liveEnd = origRawEnd;
+
+  function onMove(ev) {{
+    const rect = timeline.getBoundingClientRect();
+    const deltaPx = ev.clientX - startClientX;
+    const deltaSec = (deltaPx / rect.width) * TOTAL_DURATION;
+    const MIN_DUR = 0.2;
+    if (edge === 'start') {{
+      liveStart = Math.max(0, Math.min(origRawEnd - MIN_DUR, origRawStart + deltaSec));
+      const newLeftPct = ((origOutputStart + (liveStart - origRawStart)) / TOTAL_DURATION) * 100;
+      clipDiv.style.left = newLeftPct + '%';
+      clipDiv.style.width = (((origOutputEnd - origOutputStart) - (liveStart - origRawStart)) / TOTAL_DURATION) * 100 + '%';
+      label.style.left = '0%';
+      label.textContent = 'start ' + fmtRaw(liveStart);
+    }} else {{
+      liveEnd = Math.max(origRawStart + MIN_DUR, origRawEnd + deltaSec);
+      clipDiv.style.width = (((origOutputEnd - origOutputStart) + (liveEnd - origRawEnd)) / TOTAL_DURATION) * 100 + '%';
+      label.style.left = '100%';
+      label.textContent = 'end ' + fmtRaw(liveEnd);
+    }}
+  }}
+
+  function onUp() {{
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    label.remove();
+    clipDiv.classList.remove('dragging');
+    handle.classList.remove('dragging');
+    if (Math.abs(liveStart - origRawStart) < 0.01 && Math.abs(liveEnd - origRawEnd) < 0.01) {{
+      renderTimeline();
+      renderFlagMarkers();
+      return; // no real movement, just a click-through -- don't trigger a render
+    }}
+    saveTrim(clipIndex, liveStart, liveEnd);
+  }}
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}}
+
+async function saveTrim(clipIndex, newStart, newEnd) {{
+  if (!(newEnd > newStart)) {{
+    renderTimeline();
+    renderFlagMarkers();
+    return;
+  }}
+  const statusEl = document.getElementById('trimStatus');
+  const saveBtn = document.getElementById('saveTrimBtn');
+  if (saveBtn) {{ saveBtn.disabled = true; saveBtn.textContent = 'Re-rendering...'; }}
+  if (statusEl) {{ statusEl.textContent = 're-rendering...'; statusEl.className = 'trim-status'; }}
+  try {{
+    const resp = await fetch('/api/trim', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{project: PROJECT_NAME, clip_index: clipIndex, start: newStart, end: newEnd}}),
+    }});
+    const data = await resp.json();
+    if (!data.ok) {{
+      if (statusEl) {{ statusEl.textContent = 'failed: ' + (data.error || 'unknown error'); statusEl.className = 'trim-status err'; }}
+      renderTimeline();
+      renderFlagMarkers();
+      return;
+    }}
+    CUTMAP = data.cutmap;
+    TOTAL_DURATION = data.total_duration;
+    if (editingClipIndex !== null) {{
+      openTrimPanel(editingClipIndex); // refresh the panel's inputs to the saved values
+    }} else {{
+      renderTimeline();
+      renderFlagMarkers();
+    }}
+    video.src = video.getAttribute('src').split('?')[0] + '?t=' + Date.now();
+    video.load();
+    if (statusEl) {{ statusEl.textContent = 'saved and re-rendered.'; statusEl.className = 'trim-status ok'; }}
+  }} catch (err) {{
+    if (statusEl) {{ statusEl.textContent = 'request failed: ' + err; statusEl.className = 'trim-status err'; }}
+    renderTimeline();
+    renderFlagMarkers();
+  }} finally {{
+    if (saveBtn) {{ saveBtn.disabled = false; saveBtn.textContent = 'Save & re-render'; }}
+  }}
 }}
 
 function openTrimPanel(i) {{
@@ -291,7 +422,7 @@ function openTrimPanel(i) {{
   }});
   document.getElementById('cancelTrimBtn').addEventListener('click', closeTrimPanel);
 
-  document.getElementById('saveTrimBtn').addEventListener('click', async () => {{
+  document.getElementById('saveTrimBtn').addEventListener('click', () => {{
     const newStart = parseFloat(startInput.value);
     const newEnd = parseFloat(endInput.value);
     if (!(newEnd > newStart)) {{
@@ -299,41 +430,7 @@ function openTrimPanel(i) {{
       trimStatus.className = 'trim-status err';
       return;
     }}
-    const saveBtn = document.getElementById('saveTrimBtn');
-    saveBtn.disabled = true;
-    saveBtn.textContent = 'Re-rendering...';
-    trimStatus.textContent = '';
-    trimStatus.className = 'trim-status';
-    try {{
-      const resp = await fetch('/api/trim', {{
-        method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{project: PROJECT_NAME, clip_index: i, start: newStart, end: newEnd}}),
-      }});
-      const data = await resp.json();
-      if (!data.ok) {{
-        trimStatus.textContent = 'failed: ' + (data.error || 'unknown error');
-        trimStatus.className = 'trim-status err';
-        saveBtn.disabled = false;
-        saveBtn.textContent = 'Save & re-render';
-        return;
-      }}
-      CUTMAP = data.cutmap;
-      TOTAL_DURATION = data.total_duration;
-      renderTimeline();
-      renderFlagMarkers();
-      video.src = video.getAttribute('src').split('?')[0] + '?t=' + Date.now();
-      video.load();
-      trimStatus.textContent = 'saved and re-rendered.';
-      trimStatus.className = 'trim-status ok';
-      saveBtn.disabled = false;
-      saveBtn.textContent = 'Save & re-render';
-    }} catch (err) {{
-      trimStatus.textContent = 'request failed: ' + err;
-      trimStatus.className = 'trim-status err';
-      saveBtn.disabled = false;
-      saveBtn.textContent = 'Save & re-render';
-    }}
+    saveTrim(i, newStart, newEnd);
   }});
 }}
 
